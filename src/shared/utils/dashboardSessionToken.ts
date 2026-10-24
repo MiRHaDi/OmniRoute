@@ -21,7 +21,6 @@ export const DASHBOARD_SESSION_CLAIM = "authenticated";
 export const SESSIONS_VALID_AFTER_SETTING = "sessionsValidAfter";
 /** Ids (`jti`) of sessions that signed out before they expired, kept until their own expiry. */
 export const REVOKED_SESSIONS_SETTING = "revokedDashboardSessions";
-const MAX_REVOKED_SESSIONS = 500;
 export const DASHBOARD_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 
 export type RevokedSession = { jti: string; exp: number };
@@ -38,20 +37,16 @@ export async function mintDashboardSessionToken(
   if (session && (!session.jti || !Number.isFinite(session.iat))) {
     throw new Error("Invalid dashboard session refresh identity");
   }
+  const jti = session?.jti ?? crypto.randomUUID();
+  const exp = Math.floor(Date.now() / 1000) + DASHBOARD_SESSION_MAX_AGE_SECONDS;
+  const { reserveDashboardSessionExpiry } = await import("@/lib/db/dashboardSessions");
+  reserveDashboardSessionExpiry(jti, exp);
   return new SignJWT({ [DASHBOARD_SESSION_CLAIM]: true })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt(session?.iat ?? Math.floor(Date.now() / 1000))
-    .setJti(session?.jti ?? crypto.randomUUID())
-    .setExpirationTime(Math.floor(Date.now() / 1000) + DASHBOARD_SESSION_MAX_AGE_SECONDS)
+    .setJti(jti)
+    .setExpirationTime(exp)
     .sign(secret);
-}
-
-/** A copied pre-refresh cookie must revoke the later copies for their entire remaining life. */
-export function getDashboardRevocationExpiry(
-  payload: Pick<JWTPayload, "exp">,
-  nowSeconds = Math.floor(Date.now() / 1000)
-): number {
-  return Math.max(payload.exp ?? 0, nowSeconds + DASHBOARD_SESSION_MAX_AGE_SECONDS);
 }
 
 /** The revoked-session list with `jti` added and entries past their own expiry dropped. */
@@ -68,7 +63,7 @@ export function addRevokedSession(
       entry.exp > nowSeconds &&
       entry.jti !== session.jti
   );
-  return [...kept, session].slice(-MAX_REVOKED_SESSIONS);
+  return [...kept, session];
 }
 
 /**
@@ -77,10 +72,12 @@ export function addRevokedSession(
  * stay valid until the first password change. Fails closed: if the settings cannot be read the
  * session is not trusted.
  */
-async function isDashboardSessionEnded(payload: JWTPayload): Promise<boolean> {
+async function isDashboardSessionEnded(payload: JWTPayload, token: string): Promise<boolean> {
   try {
-    const { getCachedSettings } = await import("@/lib/db/readCache");
-    const settings = (await getCachedSettings()) as Record<string, unknown>;
+    const { getSettings } = await import("@/lib/db/settings");
+    const settings = (await getSettings()) as Record<string, unknown>;
+    const { isDashboardSessionRevoked } = await import("@/lib/db/dashboardSessions");
+    if (isDashboardSessionRevoked(payload, token)) return true;
 
     const validAfter = settings[SESSIONS_VALID_AFTER_SETTING];
     if (typeof validAfter === "number" && (payload.iat ?? 0) < validAfter) return true;
@@ -96,6 +93,23 @@ async function isDashboardSessionEnded(payload: JWTPayload): Promise<boolean> {
     return false;
   } catch {
     return true;
+  }
+}
+
+/** Signature-only validation for logout: persistence failures must not look like
+ * an absent session and accidentally acknowledge an unpersisted revocation. */
+export async function readSignedDashboardSessionToken(
+  token: string | null | undefined,
+  secret: Uint8Array | null = getDashboardJwtSecret()
+): Promise<JWTPayload | null> {
+  if (!token || typeof token !== "string" || !secret || secret.length === 0) return null;
+  try {
+    const { payload } = await jwtVerify(token, secret, { algorithms: ["HS256"] });
+    return payload[DASHBOARD_SESSION_CLAIM] === true && Number.isFinite(payload.exp)
+      ? payload
+      : null;
+  } catch {
+    return null;
   }
 }
 
@@ -116,9 +130,9 @@ export async function verifyDashboardSessionToken(
 ): Promise<JWTPayload | null> {
   if (!token || typeof token !== "string" || !secret || secret.length === 0) return null;
   try {
-    const { payload } = await jwtVerify(token, secret, { algorithms: ["HS256"] });
-    if (payload[DASHBOARD_SESSION_CLAIM] === true) {
-      return (await isDashboardSessionEnded(payload)) ? null : payload;
+    const payload = await readSignedDashboardSessionToken(token, secret);
+    if (payload) {
+      return (await isDashboardSessionEnded(payload, token)) ? null : payload;
     }
     return null;
   } catch {

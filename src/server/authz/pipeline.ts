@@ -170,8 +170,8 @@ async function refreshDashboardSessionIfNeeded(
       sameSite: "lax",
       path: "/",
     });
-  } catch (error) {
-    console.error("[Authz] JWT auto-refresh failed:", error);
+  } catch {
+    console.warn("[Authz] Dashboard session renewal unavailable; retry or sign in again");
   }
 }
 

@@ -1,7 +1,10 @@
 import test from "node:test";
+import "../_setup/isolateDataDir.ts";
 import assert from "node:assert/strict";
 import { decodeJwt } from "jose";
 import * as session from "../../src/shared/utils/dashboardSessionToken.ts";
+import { resetDbInstance } from "../../src/lib/db/core.ts";
+test.after(() => resetDbInstance());
 
 const secret = new TextEncoder().encode("session-refresh-unit-test-only");
 
@@ -33,13 +36,6 @@ test("refresh cannot move a session past a later password-change cutoff", async 
     await session.mintDashboardSessionToken(secret, { jti: "old-session", iat: cutoff - 60 })
   );
   assert.ok(renewed.iat! < cutoff);
-});
-
-test("revoking an older copy retains the revocation for the whole refresh horizon", () => {
-  const now = 1000;
-  const expiry = session.getDashboardRevocationExpiry({ exp: now + 3600 }, now);
-  assert.equal(expiry, now + 30 * 86400);
-  assert.ok(expiry >= now + 29 * 86400);
 });
 
 test("fresh sign-ins still receive independent identities", async () => {

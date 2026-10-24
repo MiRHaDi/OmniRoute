@@ -199,11 +199,11 @@ test("auto-refresh preserves the session identity and issue time; signing out en
   assert.equal(await verifyDashboardSessionToken(old), null);
   assert.equal(await verifyDashboardSessionToken(renewed), null);
   assert.ok(await verifyDashboardSessionToken(unrelated));
-  const settings = await settingsDb.getSettings();
-  const entries = settings[REVOKED_SESSIONS_SETTING] as Array<{ jti: string; exp: number }>;
-  assert.ok(
-    entries.find((entry) => entry.jti === decodeJwt(old).jti)!.exp >= decodeJwt(renewed).exp!
-  );
+  const row = core
+    .getDbInstance()
+    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+    .get("dashboardSessionLifetimes", `jti:${decodeJwt(old).jti}`) as { value: string };
+  assert.ok(JSON.parse(row.value).exp >= decodeJwt(renewed).exp!);
 });
 
 test("legacy cookies without session identity are not extended into a new independent session", async () => {
@@ -243,7 +243,32 @@ test("signing out with an invalid or missing cookie still clears it and revokes 
   assert.equal(settings[REVOKED_SESSIONS_SETTING], undefined);
 });
 
-test("the revoked-session list drops expired entries, deduplicates and stays bounded", () => {
+test("a failed revocation returns a retryable error and keeps the browser cookie", async () => {
+  const token = await mintDashboardSessionToken(secret);
+  const original = { ...logoutRoute.logoutRouteInternals };
+  let deleted = false;
+  logoutRoute.logoutRouteInternals.getCookieStore = (async () => ({
+    get: () => ({ value: token }),
+    delete: () => {
+      deleted = true;
+    },
+  })) as typeof original.getCookieStore;
+  logoutRoute.logoutRouteInternals.revokeSession = () => {
+    throw new Error("private-fixture-failure");
+  };
+  try {
+    const response = await logoutRoute.POST(
+      new Request("http://localhost/api/auth/logout", { method: "POST" })
+    );
+    assert.equal(response.status, 503);
+    assert.equal(deleted, false);
+    assert.equal(JSON.stringify(await response.json()).includes("private-fixture-failure"), false);
+  } finally {
+    Object.assign(logoutRoute.logoutRouteInternals, original);
+  }
+});
+
+test("the legacy revoked-session list drops expired entries and duplicates without evicting live sessions", () => {
   const now = 1_000;
   const list = addRevokedSession(
     [
@@ -262,6 +287,6 @@ test("the revoked-session list drops expired entries, deduplicates and stays bou
 
   let big: unknown = [];
   for (let i = 0; i < 600; i += 1) big = addRevokedSession(big, { jti: `s${i}`, exp: 5_000 }, now);
-  assert.equal((big as unknown[]).length, 500);
+  assert.equal((big as unknown[]).length, 600);
   assert.equal((big as Array<{ jti: string }>).at(-1)?.jti, "s599");
 });

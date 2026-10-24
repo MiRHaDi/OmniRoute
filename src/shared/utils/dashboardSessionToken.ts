@@ -22,6 +22,7 @@ export const SESSIONS_VALID_AFTER_SETTING = "sessionsValidAfter";
 /** Ids (`jti`) of sessions that signed out before they expired, kept until their own expiry. */
 export const REVOKED_SESSIONS_SETTING = "revokedDashboardSessions";
 const MAX_REVOKED_SESSIONS = 500;
+export const DASHBOARD_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 
 export type RevokedSession = { jti: string; exp: number };
 
@@ -30,13 +31,27 @@ export type RevokedSession = { jti: string; exp: number };
  * issue time and an id, which is what `verifyDashboardSessionToken` needs to honour a password
  * change or a sign-out before the 30 days are up.
  */
-export async function mintDashboardSessionToken(secret: Uint8Array): Promise<string> {
+export async function mintDashboardSessionToken(
+  secret: Uint8Array,
+  session?: { jti: string; iat: number }
+): Promise<string> {
+  if (session && (!session.jti || !Number.isFinite(session.iat))) {
+    throw new Error("Invalid dashboard session refresh identity");
+  }
   return new SignJWT({ [DASHBOARD_SESSION_CLAIM]: true })
     .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setJti(crypto.randomUUID())
-    .setExpirationTime("30d")
+    .setIssuedAt(session?.iat ?? Math.floor(Date.now() / 1000))
+    .setJti(session?.jti ?? crypto.randomUUID())
+    .setExpirationTime(Math.floor(Date.now() / 1000) + DASHBOARD_SESSION_MAX_AGE_SECONDS)
     .sign(secret);
+}
+
+/** A copied pre-refresh cookie must revoke the later copies for their entire remaining life. */
+export function getDashboardRevocationExpiry(
+  payload: Pick<JWTPayload, "exp">,
+  nowSeconds = Math.floor(Date.now() / 1000)
+): number {
+  return Math.max(payload.exp ?? 0, nowSeconds + DASHBOARD_SESSION_MAX_AGE_SECONDS);
 }
 
 /** The revoked-session list with `jti` added and entries past their own expiry dropped. */

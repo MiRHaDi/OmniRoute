@@ -5,7 +5,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SignJWT } from "jose";
+import { SignJWT, decodeJwt } from "jose";
+import { NextRequest } from "next/server";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-session-invalidation-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
@@ -17,6 +18,7 @@ const settingsDb = await import("../../src/lib/db/settings.ts");
 const settingsRoute = await import("../../src/app/api/settings/route.ts");
 const logoutRoute = await import("../../src/app/api/auth/logout/route.ts");
 const sessionToken = await import("../../src/shared/utils/dashboardSessionToken.ts");
+const pipeline = await import("../../src/server/authz/pipeline.ts");
 
 const {
   DASHBOARD_SESSION_COOKIE,
@@ -155,6 +157,68 @@ test("signing out revokes that session only", async () => {
   assert.deepEqual(deleted, [DASHBOARD_SESSION_COOKIE]);
   assert.equal(await verifyDashboardSessionToken(signedOut), null, "a copy of the token is dead");
   assert.ok(await verifyDashboardSessionToken(otherDevice));
+});
+
+test("auto-refresh preserves the session identity and issue time; signing out ends every variant", async () => {
+  const issuedAt = nowSeconds() - 29 * 24 * 60 * 60;
+  const old = await new SignJWT({ authenticated: true })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt(issuedAt)
+    .setJti(crypto.randomUUID())
+    .setExpirationTime("1d")
+    .sign(secret);
+  const unrelated = await mintDashboardSessionToken(secret);
+  const response = await pipeline.runAuthzPipeline(
+    new NextRequest("http://localhost/dashboard", { headers: { cookie: `auth_token=${old}` } }),
+    { enforce: true }
+  );
+  assert.equal(response.status, 200);
+  const renewed = /auth_token=([^;]+)/.exec(response.headers.get("set-cookie") || "")?.[1];
+  assert.ok(renewed);
+  assert.equal(decodeJwt(renewed).jti, decodeJwt(old).jti);
+  assert.equal(
+    decodeJwt(renewed).iat,
+    issuedAt,
+    "refresh must not reset the password-cutoff clock"
+  );
+
+  const original = logoutRoute.logoutRouteInternals.getCookieStore;
+  logoutRoute.logoutRouteInternals.getCookieStore = (async () => ({
+    get: () => ({ value: old }),
+    delete: () => {},
+  })) as typeof original;
+  try {
+    assert.equal(
+      (await logoutRoute.POST(new Request("http://localhost/api/auth/logout", { method: "POST" })))
+        .status,
+      200
+    );
+  } finally {
+    logoutRoute.logoutRouteInternals.getCookieStore = original;
+  }
+  assert.equal(await verifyDashboardSessionToken(old), null);
+  assert.equal(await verifyDashboardSessionToken(renewed), null);
+  assert.ok(await verifyDashboardSessionToken(unrelated));
+  const settings = await settingsDb.getSettings();
+  const entries = settings[REVOKED_SESSIONS_SETTING] as Array<{ jti: string; exp: number }>;
+  assert.ok(
+    entries.find((entry) => entry.jti === decodeJwt(old).jti)!.exp >= decodeJwt(renewed).exp!
+  );
+});
+
+test("legacy cookies without session identity are not extended into a new independent session", async () => {
+  const old = await new SignJWT({ authenticated: true })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt(nowSeconds() - 29 * 86400)
+    .setExpirationTime("1h")
+    .sign(secret);
+  const response = await pipeline.runAuthzPipeline(
+    new NextRequest("http://localhost/dashboard", { headers: { cookie: `auth_token=${old}` } }),
+    { enforce: true }
+  );
+  assert.equal(response.status, 200);
+  // Legacy cookies remain subject to their original expiry and password cutoff.
+  assert.equal(response.headers.get("set-cookie"), null);
 });
 
 test("signing out with an invalid or missing cookie still clears it and revokes nothing", async () => {

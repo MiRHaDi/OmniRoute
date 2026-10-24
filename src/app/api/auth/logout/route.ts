@@ -6,6 +6,7 @@ import {
   REVOKED_SESSIONS_SETTING,
   addRevokedSession,
   verifyDashboardSessionToken,
+  getDashboardRevocationExpiry,
 } from "@/shared/utils/dashboardSessionToken";
 import { cookies } from "next/headers";
 
@@ -28,7 +29,7 @@ export async function POST(request) {
       await updateSettings({
         [REVOKED_SESSIONS_SETTING]: addRevokedSession(
           settings[REVOKED_SESSIONS_SETTING],
-          { jti: payload.jti, exp: payload.exp },
+          { jti: payload.jti, exp: getDashboardRevocationExpiry(payload) },
           Math.floor(Date.now() / 1000)
         ),
       });

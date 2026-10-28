@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { buildErrorBody } from "@omniroute/open-sse/utils/error.ts";
 import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
 import { revokeDashboardSession } from "@/lib/db/dashboardSessions";
 import {
@@ -24,10 +25,24 @@ export async function POST(request) {
     if (payload && token) {
       logoutRouteInternals.revokeSession(payload, token);
     }
-  } catch {
+  } catch (error) {
+    console.error(
+      "[auth] Failed to revoke the signed-out session:",
+      error instanceof Error ? error.name : typeof error
+    );
+    logAuditEvent({
+      action: "auth.logout.failed",
+      actor: "admin",
+      target: "dashboard-auth",
+      resourceType: "auth_session",
+      status: "failed",
+      ipAddress: auditContext.ipAddress || undefined,
+      requestId: auditContext.requestId,
+      metadata: { reason: "revocation_not_persisted" },
+    });
     return NextResponse.json(
-      { success: false, error: "Sign-out could not be saved. Please retry." },
-      { status: 503 }
+      buildErrorBody(503, "Sign-out could not be completed. Please try again."),
+      { status: 503, headers: { "Cache-Control": "no-store", "Retry-After": "1" } }
     );
   }
 
